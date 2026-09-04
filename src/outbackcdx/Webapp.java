@@ -434,7 +434,24 @@ class Webapp implements Web.Handler {
 
                 long size = 0L;
                 long initialSeqNo = -1;
-                while (true) {
+                /*
+                 * getBatch() must only be called while the iterator is
+                 * positioned on a batch. RocksDB's
+                 * TransactionLogIteratorImpl::GetBatch() moves current_batch_
+                 * out of the iterator and only asserts is_valid_ -- assertions
+                 * are disabled in production -- so calling it otherwise returns
+                 * a BatchResult wrapping a null pointer. The Java side then
+                 * constructs WriteBatch(0, true) and WriteBatch.data() reads a
+                 * member off a null base, killing the JVM with SIGSEGV rather
+                 * than throwing.
+                 *
+                 * getUpdatesSince() can hand back an unpositioned iterator, so
+                 * the check is needed before the first call and not only
+                 * between iterations (the loop's trailing isValid() already
+                 * covers the rest). An empty feed is then a normal empty JSON
+                 * array instead of a crash.
+                 */
+                while (logReader.isValid()) {
                     BatchResult batch = logReader.getBatch();
                     long sequenceNumber = batch.sequenceNumber();
 

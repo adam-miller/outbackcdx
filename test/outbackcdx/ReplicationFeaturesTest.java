@@ -82,6 +82,23 @@ public class ReplicationFeaturesTest {
         }
     }
 
+    /**
+     * A collection whose WAL holds no batches yields an unpositioned
+     * TransactionLogIterator, and getBatch() must not be called on one.
+     *
+     * Without the isValid() guard in ChangeFeedJsonStream this fails here as an
+     * AssertionError from RocksDB's own assert(isValid()), because surefire runs
+     * with assertions enabled. Production does not: there the assert is skipped,
+     * getBatch() returns a WriteBatch whose native handle is 0, and
+     * WriteBatch.data() kills the JVM with a SIGSEGV.
+     */
+    @Test
+    public void testChangeFeedOnCollectionWithNoWrites() throws Exception {
+        // Creates the collection without writing any records to it.
+        POST("/nowrites", "", OK);
+        assertEquals("[\n\n]\n", GET("/nowrites/changes", OK, "since", "0"));
+    }
+
     /*@Test
     public void testDeleteWals() throws Exception {
         FeatureFlags.setSecondaryMode(false);
