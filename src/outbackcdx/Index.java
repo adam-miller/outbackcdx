@@ -49,6 +49,20 @@ public class Index {
         return logReader;
     }
 
+    /**
+     * Where a replica has replicated up to, in the primary's sequence space:
+     * the next sequence it expects, so it equals the primary's latest + 1 when
+     * caught up. Written only by ChangePollingThread, and absent on a node that
+     * is not replicating this collection.
+     */
+    static final byte[] REPLICATION_SEQUENCE_KEY = "#ReplicationSequence".getBytes(US_ASCII);
+
+    public OptionalLong getReplicationSequence() throws RocksDBException {
+        byte[] value = db.get(REPLICATION_SEQUENCE_KEY);
+        return value == null ? OptionalLong.empty()
+                             : OptionalLong.of(Long.parseLong(new String(value, US_ASCII)));
+    }
+
     public long getLatestSequenceNumber() {
         return db.getLatestSequenceNumber();
     }

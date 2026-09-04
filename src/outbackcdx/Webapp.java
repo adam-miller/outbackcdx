@@ -201,12 +201,28 @@ class Webapp implements Web.Handler {
         Index index = getIndex(req);
         Map<String,Object> map = new HashMap<>();
         map.put("estimatedRecordCount", index.estimatedRecordCount());
+        map.put("latestSequenceNumber", index.getLatestSequenceNumber());
+        try {
+            // Together these let a monitoring client compute how far a replica is
+            // behind, and how much room it has left before its position ages out
+            // of the primary's WAL. Both are absent where they mean nothing: a
+            // primary has no cursor, and a collection may have no retained WAL.
+            index.getReplicationSequence().ifPresent(
+                    sequence -> map.put("nextReplicationSequence", sequence));
+            index.getOldestAvailableSequenceNumber().ifPresent(
+                    sequence -> map.put("oldestAvailableSequenceNumber", sequence));
+        } catch (RocksDBException e) {
+            throw new IOException(e);
+        }
 
-        for (String property : req.param("property", "").split(",")) {
-            try {
-                map.put(property, index.db.getProperty(property));
-            } catch (RocksDBException e) {
-                map.put(property, "ERROR: " + e);
+        String properties = req.param("property", "");
+        if (!properties.isEmpty()) {
+            for (String property : properties.split(",")) {
+                try {
+                    map.put(property, index.db.getProperty(property));
+                } catch (RocksDBException e) {
+                    map.put(property, "ERROR: " + e);
+                }
             }
         }
 

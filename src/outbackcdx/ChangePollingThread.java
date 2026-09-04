@@ -21,8 +21,6 @@ import java.util.Date;
 import static outbackcdx.Json.JSON_MAPPER;
 
 public class ChangePollingThread extends Thread {
-    final byte[] SEQ_NUM_KEY = "#ReplicationSequence".getBytes();
-
     String primaryReplicationUrl = null;
     int pollingInterval = 10;
     DataStore dataStore = null;
@@ -61,14 +59,14 @@ public class ChangePollingThread extends Thread {
             try {
                 long startTime = System.currentTimeMillis();
                 try {
-                    byte[] output = this.index.db.get(SEQ_NUM_KEY);
+                    byte[] output = this.index.db.get(Index.REPLICATION_SEQUENCE_KEY);
                     if(output == null){
                         since = "0";
                     } else {
                         since = new String(output);
                     }
                 } catch (RocksDBException e) {
-                    System.err.println(new Date() + " " + getName() + ": Received rocks db exception while looking up the value of the key " + new String(SEQ_NUM_KEY) + " locally");
+                    System.err.println(new Date() + " " + getName() + ": Received rocks db exception while looking up the value of the key " + new String(Index.REPLICATION_SEQUENCE_KEY) + " locally");
                     e.printStackTrace();
                 }
                 finalUrl = primaryReplicationUrl + "/changes?size=" + batchSize + "&since=" + since;
@@ -197,7 +195,7 @@ public class ChangePollingThread extends Thread {
         try (WriteBatch batch = new WriteBatch(writeBatchData)){
             // count() must be read before the marker put below, which would
             long nextSequenceNumber = sequenceNumber + batch.count();
-            batch.put(SEQ_NUM_KEY, String.valueOf(nextSequenceNumber).getBytes(StandardCharsets.US_ASCII));
+            batch.put(Index.REPLICATION_SEQUENCE_KEY, String.valueOf(nextSequenceNumber).getBytes(StandardCharsets.US_ASCII));
             index.commitBatch(batch);
         }
     }

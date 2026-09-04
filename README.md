@@ -222,7 +222,21 @@ stops receiving writes will eventually age out entirely, and a secondary that
 was still following it gets a 410. `since=0` is not exempt: a secondary cannot
 be created from the change feed alone unless the primary's WAL still reaches the
 collection's first write.
-        
+
+`/{collection}/stats` reports the sequence numbers needed to monitor this,
+always, regardless of the `property` parameter:
+
+| Field | Meaning |
+|-------|---------|
+| `latestSequenceNumber` | The last sequence written here, as `/{collection}/sequence` returns |
+| `nextReplicationSequence` | The next sequence this node wants from its primary. Absent unless the node replicates this collection |
+| `oldestAvailableSequenceNumber` | The oldest sequence the WAL still covers. Absent when no WAL is retained |
+
+A secondary is caught up when its `nextReplicationSequence` equals the primary's
+`latestSequenceNumber` plus one, and is heading for a 410 as it approaches the
+primary's `oldestAvailableSequenceNumber`.
+
+
 Configuring replay tools
 ------------------------
 

@@ -1,5 +1,7 @@
 package outbackcdx;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.*;
 import org.junit.rules.TemporaryFolder;
 
@@ -270,6 +272,37 @@ public class ReplicationFeaturesTest {
         }
     }
 
+    /**
+     * Replication lag is (primary latest + 1) - (replica cursor), and both halves
+     * have to be readable from /stats so a monitoring client needs no extra
+     * request. The cursor is reported only where one exists.
+     */
+    @Test
+    public void testStatsCarriesReplicationPosition() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        POST("/dest", "", OK);
+        try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", webapp, new NullAuthorizer())) {
+            server.start();
+            ChangePollingThread polling = pollingThread(server, "dest");
+            replicateSince(polling, 0);
+
+            String primary = GET("/src/stats", OK);
+            String replica = GET("/dest/stats", OK);
+
+            assertTrue("a primary has no cursor to report",
+                    !primary.contains("nextReplicationSequence"));
+            assertEquals(Long.parseLong(GET("/src/sequence", OK)),
+                    jsonLong(primary, "latestSequenceNumber"));
+            assertEquals(storedCursor(polling), jsonLong(replica, "nextReplicationSequence"));
+        }
+    }
+
+    private static long jsonLong(String json, String field) throws IOException {
+        JsonNode value = new ObjectMapper().readTree(json).get(field);
+        assertNotNull(field + " missing from " + json, value);
+        return value.asLong();
+    }
+
     private ChangePollingThread pollingThread(UWeb.UServer server, String destination) throws IOException {
         ChangePollingThread polling = new ChangePollingThread(
                 "http://localhost:" + server.port() + "/src", 1000, 10 * 1024 * 1024, manager);
@@ -286,9 +319,9 @@ public class ReplicationFeaturesTest {
     }
 
     private long storedCursor(ChangePollingThread polling) throws Exception {
-        byte[] value = polling.index.db.get(polling.SEQ_NUM_KEY);
-        assertNotNull("replication cursor was never stored", value);
-        return Long.parseLong(new String(value, US_ASCII));
+        OptionalLong cursor = polling.index.getReplicationSequence();
+        assertTrue("replication cursor was never stored", cursor.isPresent());
+        return cursor.getAsLong();
     }
 
     /**
