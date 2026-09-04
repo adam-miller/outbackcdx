@@ -416,11 +416,14 @@ class Webapp implements Web.Handler {
     }
 
     /**
-     * Body of a change feed carrying no batches. Must stay byte-identical to
-     * what ChangeFeedJsonStream emits for an empty iterator, so a client cannot
-     * tell the two empty paths apart.
+     * A valid replication position with nothing to read. The cursor is fine and
+     * the client should leave it untouched.
      */
-    static final String EMPTY_CHANGE_FEED = "[\n\n]\n";
+    private static Response noContent() {
+        Response response = new Response(NO_CONTENT, null, "");
+        response.addHeader("Access-Control-Allow-Origin", "*");
+        return response;
+    }
 
     static class ChangeFeedJsonStream implements IStreamer, Closeable {
         final TransactionLogIterator logReader;
@@ -538,26 +541,52 @@ class Webapp implements Web.Handler {
             out.printf("%s Received request %s. Retrieving deltas for collection <%s> since sequenceNumber %s%n", new Date(), request, collection, since);
         }
 
+        long latest = index.getLatestSequenceNumber();
+        OptionalLong oldestAvailable;
+        try {
+            oldestAvailable = index.getOldestAvailableSequenceNumber();
+        } catch (RocksDBException e) {
+            throw new IOException(e);
+        }
+
+        // getUpdatesSince() silently skips past a purged sequence rather than
+        // failing, so refuse it here, before an iterator exists and the status is
+        // committed. Sequence 0 holds no data, hence the clamp to 1.
+        long firstPossibleSequence = Math.max(since, 1);
+        boolean pointsAtRealData = firstPossibleSequence <= latest;
+        boolean walCoversIt = oldestAvailable.isPresent()
+                && firstPossibleSequence >= oldestAvailable.getAsLong();
+        if (pointsAtRealData && !walCoversIt) {
+            String detail = String.format(
+                    "Sequence %d is no longer available for collection %s. Oldest available: %s. "
+                    + "Latest: %d. The replica cannot catch up from the change feed and must be "
+                    + "reseeded from the primary, or its replication cursor reset to an available "
+                    + "sequence.%n",
+                    since, collection,
+                    oldestAvailable.isPresent() ? String.valueOf(oldestAvailable.getAsLong())
+                                                : "none (no WAL retained)",
+                    latest);
+            System.err.println(new Date() + " " + request.method() + " " + request.url() + " - " + detail.trim());
+            return new Response(GONE, "text/plain", detail);
+        }
+
+        // A valid position with nothing after it is 204, not 410.
         TransactionLogIterator logReader;
         try {
             logReader = index.getUpdatesSince(since);
         } catch (RocksDBException e) {
-            /*
-             * A caught-up replica's cursor sits at the next unwritten sequence,
-             * so RocksDB reports it as not yet written until the following batch
-             * lands. That is the normal idle state of a tailing feed, not an
-             * error: answer with an empty feed so an idle replica polls quietly
-             * instead of logging a 500 every interval.
-             */
             if ("Requested sequence not yet written in the db".equals(e.getMessage())) {
-                Response response = new Response(OK, "application/json", EMPTY_CHANGE_FEED);
-                response.addHeader("Access-Control-Allow-Origin", "*");
-                return response;
+                return noContent();
             }
             System.err.println(new Date() + " " + request.method() + " " + request.url() + " - " + e);
             e.printStackTrace();
             throw new Web.ResponseException(
                     new Response(INTERNAL_ERROR, "text/plain", e + "\n"));
+        }
+        // Collection hasn't yet been written
+        if (!logReader.isValid()) {
+            logReader.close();
+            return noContent();
         }
 
         /*

@@ -54,6 +54,26 @@ public class Index {
     }
 
     /**
+     * The oldest sequence number still recoverable from the write-ahead log,
+     * or empty if no WAL files are retained. A replica whose cursor has fallen
+     * below this can no longer catch up from the change feed.
+     *
+     * Includes archived WALs, which is what --replication-window retains via
+     * WalTtlSeconds. Retention is enforced by age, not by sequence, so this
+     * rises as WALs are purged.
+     */
+    public OptionalLong getOldestAvailableSequenceNumber() throws RocksDBException {
+        OptionalLong oldest = OptionalLong.empty();
+        for (LogFile walFile : db.getSortedWalFiles()) {
+            long start = walFile.startSequence();
+            if (!oldest.isPresent() || start < oldest.getAsLong()) {
+                oldest = OptionalLong.of(start);
+            }
+        }
+        return oldest;
+    }
+
+    /**
      * Returns all captures that match the given prefix.
      */
     public CloseableIterator<Capture> prefixQuery(String surtPrefix, Predicate<Capture> filter) {

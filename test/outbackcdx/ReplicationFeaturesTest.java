@@ -6,8 +6,11 @@ import org.junit.rules.TemporaryFolder;
 import outbackcdx.Web.Status;
 import outbackcdx.auth.NullAuthorizer;
 
+import org.rocksdb.FlushOptions;
+
 import java.io.*;
 import java.util.Collections;
+import java.util.OptionalLong;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -89,6 +92,128 @@ public class ReplicationFeaturesTest {
     }
 
     /**
+     * A cursor that has aged out of the WAL retention window must be refused,
+     * not served from whatever WAL survives.
+     *
+     * This is the dangerous case. getUpdatesSince() does not fail for a purged
+     * sequence: with later WALs still present it returns an iterator positioned
+     * *after* the gap, so without this check the feed hands back post-gap
+     * batches, the replica applies them and advances its cursor, and the
+     * skipped records are lost with nothing logged anywhere.
+     */
+    @Test
+    public void testFeedRefusesSequenceOlderThanRetention() throws Exception {
+        File root = folder.newFolder();
+        // Two-second WAL retention so archived WALs become purgeable in-test.
+        // This test is necessarily timing-dependent: RocksDB enforces
+        // WalTtlSeconds by file age and only purges from its obsolete-file
+        // cleanup, which a flush triggers.
+        try (DataStore store = new DataStore(root, 256, 2L, Long.MAX_VALUE, null)) {
+            Webapp app = new Webapp(store, false, Collections.emptyMap(), null,
+                    Collections.emptyMap(), 10000, new QueryConfig(), null, null);
+            post(app, "/aged", TWO_RECORDS);
+            Index index = store.getIndex("aged");
+            long earlySequence = index.getLatestSequenceNumber();
+
+            // Roll several WALs into the archive, age them past the TTL, then
+            // write and flush again to trigger the purge -- the same sequence
+            // of events as the production incident, where a checkpoint's flush
+            // collected WALs that had expired days earlier.
+            for (int i = 0; i < 3; i++) {
+                post(app, "/aged", TWO_RECORDS);
+                flushAll(index);
+            }
+            Thread.sleep(4000);
+            post(app, "/aged", TWO_RECORDS);
+            flushAll(index);
+
+            OptionalLong oldest = index.getOldestAvailableSequenceNumber();
+            assertTrue("expected the early WAL to be purged, oldest available is " + oldest,
+                    oldest.isPresent() && oldest.getAsLong() > earlySequence);
+
+            Web.Response refused = app.handle(withParams(new DummyRequest(GET, "/aged/changes"),
+                    "since", String.valueOf(earlySequence)));
+            assertEquals(Status.GONE, refused.getStatus());
+            assertTrue(slurp(refused).contains("no longer available"));
+
+            // since=0 is not exempt: the WAL no longer reaches the start of the
+            // collection, so a replica cannot bootstrap completely from the feed.
+            Web.Response fromScratch = app.handle(withParams(new DummyRequest(GET, "/aged/changes"),
+                    "since", "0"));
+            assertEquals(Status.GONE, fromScratch.getStatus());
+
+            // And a sequence still covered by a retained WAL is served.
+            Web.Response served = app.handle(withParams(new DummyRequest(GET, "/aged/changes"),
+                    "since", String.valueOf(oldest.getAsLong())));
+            assertEquals(OK, served.getStatus());
+        }
+    }
+
+    /** Both column families must flush before their WAL can be archived. */
+    private static void flushAll(Index index) throws Exception {
+        try (FlushOptions options = new FlushOptions().setWaitForFlush(true)) {
+            index.db.flush(options, java.util.Arrays.asList(index.defaultCF, index.aliasCF));
+        }
+    }
+
+    /**
+     * Being caught up must not be confused with having aged out. A cursor at
+     * the tail is ahead of every retained sequence, so it answers empty rather
+     * than 410.
+     */
+    @Test
+    public void testCaughtUpCursorAnswers204NotGone() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        long tail = Long.parseLong(GET("/src/sequence", OK)) + 1;
+        Web.Response response = webapp.handle(withParams(new DummyRequest(GET, "/src/changes"),
+                "since", String.valueOf(tail)));
+        assertEquals(Status.NO_CONTENT, response.getStatus());
+        assertEquals("", slurp(response));
+    }
+
+    /**
+     * A replica whose cursor was reset to the tail of a collection with no
+     * retained WAL is caught up, not aged out. It must get 204, since 410
+     * would send an operator chasing a resync it does not need. This is the
+     * state a recovered replica lands in.
+     */
+    @Test
+    public void testTailCursorOnPurgedWalIsNotGone() throws Exception {
+        File root = folder.newFolder();
+        try (DataStore store = new DataStore(root, 256, 2L, Long.MAX_VALUE, null)) {
+            Webapp app = new Webapp(store, false, Collections.emptyMap(), null,
+                    Collections.emptyMap(), 10000, new QueryConfig(), null, null);
+            post(app, "/tail", TWO_RECORDS);
+            Index index = store.getIndex("tail");
+            for (int i = 0; i < 3; i++) {
+                post(app, "/tail", TWO_RECORDS);
+                flushAll(index);
+            }
+            Thread.sleep(4000);
+            post(app, "/tail", TWO_RECORDS);
+            flushAll(index);
+
+            long tail = index.getLatestSequenceNumber() + 1;
+            Web.Response response = app.handle(withParams(new DummyRequest(GET, "/tail/changes"),
+                    "since", String.valueOf(tail)));
+            assertEquals(Status.NO_CONTENT, response.getStatus());
+        }
+    }
+
+    private static DummyRequest withParams(DummyRequest request, String... keysAndValues) {
+        for (int i = 0; i < keysAndValues.length; i += 2) {
+            request.parm(keysAndValues[i], keysAndValues[i + 1]);
+        }
+        return request;
+    }
+
+    private String post(Webapp app, String url, String data) throws Exception {
+        Web.Response response = app.handle(new DummyRequest(POST, url, data));
+        assertEquals(OK, response.getStatus());
+        return slurp(response);
+    }
+
+    /**
      * The cursor must land on the primary's next unwritten sequence, so that a
      * caught-up replica transfers nothing. Storing the applied batch's own
      * sequence number left it one batch behind, and because /changes is
@@ -145,19 +270,6 @@ public class ReplicationFeaturesTest {
         }
     }
 
-    /**
-     * Asking for a sequence the primary has not written yet is the steady state
-     * of a caught-up replica, so it answers with an empty feed. It used to be a
-     * 500, which would have meant a logged exception on every idle poll.
-     */
-    @Test
-    public void testChangeFeedBeyondTailIsEmptyNotError() throws Exception {
-        POST("/src", TWO_RECORDS, OK);
-        long latest = Long.parseLong(GET("/src/sequence", OK));
-        assertEquals(Webapp.EMPTY_CHANGE_FEED,
-                GET("/src/changes", OK, "since", String.valueOf(latest + 1)));
-    }
-
     private ChangePollingThread pollingThread(UWeb.UServer server, String destination) throws IOException {
         ChangePollingThread polling = new ChangePollingThread(
                 "http://localhost:" + server.port() + "/src", 1000, 10 * 1024 * 1024, manager);
@@ -193,7 +305,10 @@ public class ReplicationFeaturesTest {
     public void testChangeFeedOnCollectionWithNoWrites() throws Exception {
         // Creates the collection without writing any records to it.
         POST("/nowrites", "", OK);
-        assertEquals("[\n\n]\n", GET("/nowrites/changes", OK, "since", "0"));
+        Web.Response response = webapp.handle(withParams(new DummyRequest(GET, "/nowrites/changes"),
+                "since", "0"));
+        // Nothing exists rather than nothing survives, so 204 and not 410.
+        assertEquals(Status.NO_CONTENT, response.getStatus());
     }
 
     /*@Test

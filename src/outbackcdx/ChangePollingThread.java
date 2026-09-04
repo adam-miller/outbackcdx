@@ -130,7 +130,41 @@ public class ChangePollingThread extends Thread {
         System.out.println(new Date() + " " + getName() + ": requesting replication from " + finalUrl);
         HttpResponse response = httpclient.execute(request);
 
-        if(response.getStatusLine().getStatusCode() != 200){
+        int statusCode = response.getStatusLine().getStatusCode();
+
+        if (statusCode == 204) {
+            /*
+             * Our cursor is valid and the primary has nothing past it. Nothing
+             * to apply and nothing to record.
+             */
+            return;
+        }
+
+        if (statusCode == 404) {
+            /*
+             * The primary has no such collection. Collections are created on
+             * first write, so this can clear on its own once the
+             * primary receives data -- keep polling.
+             */
+            System.err.println(new Date() + " " + getName()
+                    + ": ERROR - collection " + collection + " does not exist on the primary; waiting for it to appear");
+            return;
+        }
+
+        if (statusCode == 410) {
+            /*
+             * Our cursor has aged out of the primary's WAL retention window, so
+             * the primary refuses to serve it rather than skipping the gap. This
+             * needs manual intervention: a reseed from a checkpoint, or a reset of
+             * #ReplicationSequence to an available sequence.
+             */
+            InputStream inputStream = response.getEntity().getContent();
+            String contentString = new BufferedReader(new InputStreamReader(inputStream)).readLine();
+            System.err.println(new Date() + " " + getName() + ": ERROR - REPLICATION STALLED, requested sequence not available: "
+                    + contentString + " (requested " + finalUrl + ")");
+            return;
+        }
+        if (statusCode != 200) {
             InputStream inputStream = response.getEntity().getContent();
             String contentString = new BufferedReader(new InputStreamReader(inputStream)).readLine();
             throw new IOException("Received '" + response.getStatusLine() + "' response from " + finalUrl +": \n" + contentString);
