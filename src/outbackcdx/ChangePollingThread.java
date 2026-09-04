@@ -161,7 +161,9 @@ public class ChangePollingThread extends Thread {
 
     private void commitWriteBatch(Index index, long sequenceNumber, byte[] writeBatchData) throws RocksDBException {
         try (WriteBatch batch = new WriteBatch(writeBatchData)){
-            batch.put(SEQ_NUM_KEY, String.valueOf(sequenceNumber).getBytes(StandardCharsets.US_ASCII));
+            // count() must be read before the marker put below, which would
+            long nextSequenceNumber = sequenceNumber + batch.count();
+            batch.put(SEQ_NUM_KEY, String.valueOf(nextSequenceNumber).getBytes(StandardCharsets.US_ASCII));
             index.commitBatch(batch);
         }
     }

@@ -415,6 +415,13 @@ class Webapp implements Web.Handler {
         return new Response(OK, "text/plain", output);
     }
 
+    /**
+     * Body of a change feed carrying no batches. Must stay byte-identical to
+     * what ChangeFeedJsonStream emits for an empty iterator, so a client cannot
+     * tell the two empty paths apart.
+     */
+    static final String EMPTY_CHANGE_FEED = "[\n\n]\n";
+
     static class ChangeFeedJsonStream implements IStreamer, Closeable {
         final TransactionLogIterator logReader;
         final long batchSize;
@@ -535,10 +542,20 @@ class Webapp implements Web.Handler {
         try {
             logReader = index.getUpdatesSince(since);
         } catch (RocksDBException e) {
-            System.err.println(new Date() + " " + request.method() + " " + request.url() + " - " + e);
-            if (!"Requested sequence not yet written in the db".equals(e.getMessage())) {
-                e.printStackTrace();
+            /*
+             * A caught-up replica's cursor sits at the next unwritten sequence,
+             * so RocksDB reports it as not yet written until the following batch
+             * lands. That is the normal idle state of a tailing feed, not an
+             * error: answer with an empty feed so an idle replica polls quietly
+             * instead of logging a 500 every interval.
+             */
+            if ("Requested sequence not yet written in the db".equals(e.getMessage())) {
+                Response response = new Response(OK, "application/json", EMPTY_CHANGE_FEED);
+                response.addHeader("Access-Control-Allow-Origin", "*");
+                return response;
             }
+            System.err.println(new Date() + " " + request.method() + " " + request.url() + " - " + e);
+            e.printStackTrace();
             throw new Web.ResponseException(
                     new Response(INTERNAL_ERROR, "text/plain", e + "\n"));
         }

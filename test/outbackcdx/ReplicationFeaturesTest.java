@@ -9,8 +9,10 @@ import outbackcdx.auth.NullAuthorizer;
 import java.io.*;
 import java.util.Collections;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static outbackcdx.Web.Method.*;
 import static outbackcdx.Web.Status.OK;
@@ -19,6 +21,10 @@ import static outbackcdx.Web.Status.OK;
 public class ReplicationFeaturesTest {
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
+
+    private static final String TWO_RECORDS =
+            "- 20050614070159 http://nla.gov.au/ text/html 200 AKMCCEPOOWFMGGO5635HFZXGFRLRGWIX - 337023 NLA-AU-CRAWL-000-20050614070144-00003-crawling016.archive.org\n"
+            + "- 20030614070159 http://example.com/ text/html 200 AKMCCEPOOWFMGGO5635HFZXGFRLRGWIX - - - 337023 NLA-AU-CRAWL-000-20050614070144-00003-crawling016.archive.org\n";
 
     private Webapp webapp;
 
@@ -80,6 +86,97 @@ public class ReplicationFeaturesTest {
             String response = GET("/dest", OK, "url", "http://nla.gov.au/two");
             assertTrue(response.contains("http://nla.gov.au/two"));
         }
+    }
+
+    /**
+     * The cursor must land on the primary's next unwritten sequence, so that a
+     * caught-up replica transfers nothing. Storing the applied batch's own
+     * sequence number left it one batch behind, and because /changes is
+     * inclusive of `since` the replica then re-fetched and re-applied that same
+     * batch on every poll indefinitely.
+     *
+     * The exact-value assertion is also what catches reading count() after the
+     * marker put: that yields primary latest + 2.
+     */
+    @Test
+    public void testCursorTracksPrimaryTail() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        POST("/dest", "", OK);
+        try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", webapp, new NullAuthorizer())) {
+            server.start();
+            ChangePollingThread polling = pollingThread(server, "dest");
+
+            replicateSince(polling, 0);
+            long primaryLatest = Long.parseLong(GET("/src/sequence", OK));
+            assertEquals(primaryLatest + 1, storedCursor(polling));
+
+            // Nothing new upstream: the poll must move no data and no cursor,
+            // and must not raise -- the feed answers empty rather than 500.
+            replicateSince(polling, storedCursor(polling));
+            assertEquals(primaryLatest + 1, storedCursor(polling));
+        }
+    }
+
+    /**
+     * A cursor one sequence too high still finds a following batch of two or
+     * more entries, because getUpdatesSince() returns the batch containing the
+     * requested sequence. A batch of exactly one entry is skipped outright, so
+     * only this case exposes that error -- as missing records rather than as a
+     * failure at the point of the mistake.
+     */
+    @Test
+    public void testSingleEntryBatchIsNotSkipped() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        POST("/dest", "", OK);
+        try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", webapp, new NullAuthorizer())) {
+            server.start();
+            ChangePollingThread polling = pollingThread(server, "dest");
+            replicateSince(polling, 0);
+
+            long before = Long.parseLong(GET("/src/sequence", OK));
+            POST("/src", "- 20050614070159 http://nla.gov.au/single text/html 200 AKMCCEPOOWFMGGO5635HFZXGFRLRGWIX - 337023 NLA-AU-CRAWL-000-20050614070144-00003-crawling016.archive.org\n", OK);
+            long after = Long.parseLong(GET("/src/sequence", OK));
+            assertEquals("expected a single-entry batch", 1, after - before);
+
+            replicateSince(polling, storedCursor(polling));
+            assertTrue(GET("/dest", OK, "url", "http://nla.gov.au/single")
+                    .contains("http://nla.gov.au/single"));
+            assertEquals(after + 1, storedCursor(polling));
+        }
+    }
+
+    /**
+     * Asking for a sequence the primary has not written yet is the steady state
+     * of a caught-up replica, so it answers with an empty feed. It used to be a
+     * 500, which would have meant a logged exception on every idle poll.
+     */
+    @Test
+    public void testChangeFeedBeyondTailIsEmptyNotError() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        long latest = Long.parseLong(GET("/src/sequence", OK));
+        assertEquals(Webapp.EMPTY_CHANGE_FEED,
+                GET("/src/changes", OK, "since", String.valueOf(latest + 1)));
+    }
+
+    private ChangePollingThread pollingThread(UWeb.UServer server, String destination) throws IOException {
+        ChangePollingThread polling = new ChangePollingThread(
+                "http://localhost:" + server.port() + "/src", 1000, 10 * 1024 * 1024, manager);
+        // By default it would replicate src to itself.
+        polling.collection = destination;
+        polling.index = manager.getIndex(destination, false);
+        return polling;
+    }
+
+    private void replicateSince(ChangePollingThread polling, long since) throws Exception {
+        polling.finalUrl = polling.primaryReplicationUrl
+                + "/changes?size=" + polling.batchSize + "&since=" + since;
+        polling.replicate();
+    }
+
+    private long storedCursor(ChangePollingThread polling) throws Exception {
+        byte[] value = polling.index.db.get(polling.SEQ_NUM_KEY);
+        assertNotNull("replication cursor was never stored", value);
+        return Long.parseLong(new String(value, US_ASCII));
     }
 
     /**
