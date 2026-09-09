@@ -18,6 +18,7 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static outbackcdx.Web.Method.*;
 import static outbackcdx.Web.Status.OK;
@@ -200,6 +201,161 @@ public class ReplicationFeaturesTest {
                     "since", String.valueOf(tail)));
             assertEquals(Status.NO_CONTENT, response.getStatus());
         }
+    }
+
+    /**
+     * A fresh replica has nothing to derive a position from, so it asks for
+     * everything and stores no sequence until a batch arrives.
+     */
+    @Test
+    public void testEmptyCollectionBootstrapsFromZero() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        POST("/dest", "", OK);
+        try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", webapp, new NullAuthorizer())) {
+            server.start();
+            ChangePollingThread polling = pollingThread(server, "dest");
+            assertEquals("0", polling.resolveSince());
+            assertEquals(OptionalLong.empty(), polling.index.getReplicationSequence());
+        }
+    }
+
+    /**
+     * The documented recovery is to copy a collection from the primary and
+     * restart. The copy carries the primary's data but none of its own
+     * replication state, so the replica has to recognise that and derive its
+     * position, or it asks for 0 and gets a 410 once the primary's WAL no longer
+     * reaches the collection's first write.
+     *
+     * Posting identical records to both collections reproduces the copy: each
+     * write consumes the same sequence numbers, so dest's latest sequence is
+     * what a copy of src would carry.
+     */
+    @Test
+    public void testCopiedCollectionAdoptsItsOwnSequence() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        POST("/dest", TWO_RECORDS, OK);
+        try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", webapp, new NullAuthorizer())) {
+            server.start();
+            ChangePollingThread polling = pollingThread(server, "dest");
+            long copiedAt = polling.index.getLatestSequenceNumber();
+
+            assertEquals(String.valueOf(copiedAt + 1), polling.resolveSince());
+            // Stored, so the derivation happens once rather than on every poll.
+            assertEquals(copiedAt + 1, storedCursor(polling));
+
+            // The primary is idle and holds nothing past that point, so the
+            // adopted position reads as caught up rather than as a gap.
+            assertEquals(Status.NO_CONTENT, webapp.handle(withParams(
+                    new DummyRequest(GET, "/src/changes"),
+                    "since", String.valueOf(copiedAt + 1))).getStatus());
+        }
+    }
+
+    /**
+     * Writes the primary took after the copy was made must still arrive.
+     */
+    @Test
+    public void testCopiedCollectionCatchesUpFromAdoptedSequence() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        POST("/dest", TWO_RECORDS, OK);
+        try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", webapp, new NullAuthorizer())) {
+            server.start();
+            ChangePollingThread polling = pollingThread(server, "dest");
+
+            POST("/src", "- 20050614070159 http://nla.gov.au/after-copy text/html 200 AKMCCEPOOWFMGGO5635HFZXGFRLRGWIX - 337023 NLA-AU-CRAWL-000-20050614070144-00003-crawling016.archive.org\n", OK);
+
+            replicateSince(polling, Long.parseLong(polling.resolveSince()));
+            assertTrue(GET("/dest", OK, "url", "http://nla.gov.au/after-copy")
+                    .contains("http://nla.gov.au/after-copy"));
+            assertEquals(Long.parseLong(GET("/src/sequence", OK)) + 1, storedCursor(polling));
+        }
+    }
+
+    /**
+     * A copy made before the primary's WAL rolled past it cannot be completed by
+     * the feed: the records between what the copy holds and what the WAL retains
+     * are gone. Adopting the copy's sequence must surface that as a 410 rather
+     * than silently resuming from the WAL floor.
+     */
+    @Test
+    public void testCopyOlderThanRetentionIsRefused() throws Exception {
+        File root = folder.newFolder();
+        try (DataStore store = new DataStore(root, 256, 2L, Long.MAX_VALUE, null)) {
+            Webapp app = new Webapp(store, false, Collections.emptyMap(), null,
+                    Collections.emptyMap(), 10000, new QueryConfig(), null, null);
+            post(app, "/aged", TWO_RECORDS);
+            post(app, "/copy", TWO_RECORDS);
+            Index primary = store.getIndex("aged");
+            long copiedAt = store.getIndex("copy").getLatestSequenceNumber();
+
+            for (int i = 0; i < 3; i++) {
+                post(app, "/aged", TWO_RECORDS);
+                flushAll(primary);
+            }
+            Thread.sleep(4000);
+            post(app, "/aged", TWO_RECORDS);
+            flushAll(primary);
+
+            OptionalLong oldest = primary.getOldestAvailableSequenceNumber();
+            assertTrue("expected the copy to fall outside the retained WAL",
+                    oldest.isPresent() && oldest.getAsLong() > copiedAt + 1);
+
+            try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", app, new NullAuthorizer())) {
+                server.start();
+                ChangePollingThread polling = new ChangePollingThread(
+                        "http://localhost:" + server.port() + "/aged", 1000, 10 * 1024 * 1024, store);
+                polling.collection = "copy";
+                polling.index = store.getIndex("copy", false);
+
+                String since = polling.resolveSince();
+                assertEquals(String.valueOf(copiedAt + 1), since);
+                assertEquals(Status.GONE, app.handle(withParams(
+                        new DummyRequest(GET, "/aged/changes"), "since", since)).getStatus());
+
+                // The poll leaves the sequence where it is, so the operator sees
+                // the position the copy was taken at rather than a moved cursor.
+                polling.finalUrl = polling.primaryReplicationUrl
+                        + "/changes?size=" + polling.batchSize + "&since=" + since;
+                polling.replicate();
+                assertEquals(copiedAt + 1, storedCursor(polling));
+            }
+        }
+    }
+
+    /**
+     * A replica that lost only its stored sequence still holds data, but that
+     * data is in its own sequence space, which runs far ahead of the primary's.
+     * Adopting it would request a sequence past the primary's tail, which reads
+     * as caught up -- a silent stall. Refuse instead.
+     */
+    @Test
+    public void testSequenceBeyondPrimaryIsRefused() throws Exception {
+        POST("/src", TWO_RECORDS, OK);
+        POST("/dest", TWO_RECORDS, OK);
+        POST("/dest", "- 20050614070159 http://nla.gov.au/local text/html 200 AKMCCEPOOWFMGGO5635HFZXGFRLRGWIX - 337023 NLA-AU-CRAWL-000-20050614070144-00003-crawling016.archive.org\n", OK);
+        try (UWeb.UServer server = new UWeb.UServer("localhost", 0, "", webapp, new NullAuthorizer())) {
+            server.start();
+            ChangePollingThread polling = pollingThread(server, "dest");
+            assertTrue(polling.index.getLatestSequenceNumber()
+                    > Long.parseLong(GET("/src/sequence", OK)));
+
+            assertNull("must not poll on a sequence it cannot justify", polling.resolveSince());
+            assertEquals(OptionalLong.empty(), polling.index.getReplicationSequence());
+        }
+    }
+
+    /**
+     * A primary that is briefly down must not be mistaken for one that has
+     * nothing to offer: deriving a position needs its sequence to check against,
+     * so without it the poll waits rather than falling back to 0.
+     */
+    @Test
+    public void testAdoptionWaitsWhenPrimaryUnreachable() throws Exception {
+        POST("/dest", TWO_RECORDS, OK);
+        ChangePollingThread polling = new ChangePollingThread(
+                "http://localhost:1/dest", 1000, 10 * 1024 * 1024, manager);
+        assertNull(polling.resolveSince());
+        assertEquals(OptionalLong.empty(), polling.index.getReplicationSequence());
     }
 
     private static DummyRequest withParams(DummyRequest request, String... keysAndValues) {

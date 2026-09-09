@@ -236,6 +236,19 @@ A secondary is caught up when its `nextReplicationSequence` equals the primary's
 `latestSequenceNumber` plus one, and is heading for a 410 as it approaches the
 primary's `oldestAvailableSequenceNumber`.
 
+### Seeding or repairing a secondary
+
+Copy the collection's directory from the primary and restart the secondary. On
+startup a collection holding data but no `#ReplicationSequence` is taken to be
+such a copy, so its own latest sequence is the primary's position when the copy
+was made, and the secondary resumes from there. An empty collection instead
+replicates from the oldest sequence the primary retains.
+
+The copy has to be newer than the primary's WAL retention, or the secondary gets
+a 410 and needs a fresher one. Copying a live RocksDB directory is not a
+consistent snapshot, so prefer `POST /{collection}/checkpoint?name=<name>` and
+copy the checkpoint; records a torn copy missed cannot be detected afterwards.
+
 
 Configuring replay tools
 ------------------------
